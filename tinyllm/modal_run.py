@@ -21,7 +21,7 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-step5")
+app = modal.App("tiny-decode-step6")
 
 
 @app.function(image=image, gpu="A10G", volumes={"/cache": hf_cache}, timeout=600)
@@ -45,12 +45,30 @@ def main(
     max_new_tokens: int = 64,
     warmup: int = 1,
     runs: int = 3,
+    check: bool = False,
+    write_snapshot: bool = False,
 ):
+    import sys
+
     out = run_remote.remote(
         prompt=prompt, max_new_tokens=max_new_tokens, warmup=warmup, runs=runs
     )
     text = out["text"]
     r = out["result"]
+
+    if check or write_snapshot:
+        from harness.snapshot import check_or_write
+
+        passed, msg = check_or_write(
+            model="gpt2",
+            prompt=prompt,
+            n_tokens=max_new_tokens,
+            text=text,
+            write=write_snapshot,
+        )
+        print(f"\n[snapshot] {msg}")
+        if not passed:
+            sys.exit(1)
 
     print(text)
     print()
