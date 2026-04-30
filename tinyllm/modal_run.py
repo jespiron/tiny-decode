@@ -21,7 +21,7 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-step3")
+app = modal.App("tiny-decode-step4")
 
 
 @app.function(image=image, gpu="A10G", volumes={"/cache": hf_cache}, timeout=600)
@@ -32,22 +32,25 @@ def run_remote(prompt: str, max_new_tokens: int, warmup: int, runs: int) -> dict
 
     lm = load_model()
 
-    warmup_throughputs: list[float] = []
     for _ in range(warmup):
-        _, per_token_seconds = generate(lm, prompt, max_new_tokens=max_new_tokens)
-        warmup_throughputs.append(len(per_token_seconds) / sum(per_token_seconds))
+        generate(lm, prompt, max_new_tokens=max_new_tokens)
 
     throughputs: list[float] = []
+    ttfts_ms: list[float] = []
+    steady_ms: list[float] = []
     text = ""
     for _ in range(runs):
         text, per_token_seconds = generate(lm, prompt, max_new_tokens=max_new_tokens)
         throughputs.append(len(per_token_seconds) / sum(per_token_seconds))
+        ttfts_ms.append(per_token_seconds[0] * 1000.0)
+        if len(per_token_seconds) > 1:
+            steady_ms.append(statistics.mean(per_token_seconds[1:]) * 1000.0)
 
     return {
         "text": text,
-        "tokens_per_sec_warmup": warmup_throughputs,
-        "tokens_per_sec_mean": statistics.mean(throughputs),
-        "tokens_per_sec_per_run": throughputs,
+        "tokens_per_sec": statistics.mean(throughputs),
+        "ttft_ms": statistics.mean(ttfts_ms),
+        "ms_per_token": statistics.mean(steady_ms) if steady_ms else float("nan"),
     }
 
 
@@ -62,8 +65,6 @@ def main(
         prompt=prompt, max_new_tokens=max_new_tokens, warmup=warmup, runs=runs
     )
     print(out["text"])
-    warmup_str = ", ".join(f"{t:.2f}" for t in out["tokens_per_sec_warmup"])
-    per_run = ", ".join(f"{t:.2f}" for t in out["tokens_per_sec_per_run"])
-    print(f"\nwarmup (discarded): [{warmup_str}] tok/s")
-    print(f"per-run tok/s:      [{per_run}]")
-    print(f"mean:               {out['tokens_per_sec_mean']:.2f} tok/s")
+    print(f"\ntokens/sec:  {out['tokens_per_sec']:.2f}")
+    print(f"TTFT:        {out['ttft_ms']:.1f} ms   (prefill)")
+    print(f"steady ms/t: {out['ms_per_token']:.2f} ms  (decode)")
