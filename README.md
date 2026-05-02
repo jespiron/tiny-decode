@@ -32,4 +32,4 @@ Now you can jump into the series, grab code from each post's branch as you follo
 | Phase | Blog Post | Branch |
 |-------|-----------|--------|
 | 0 | [Inference Engines 0/N: Foundations](https://jessicaruan.com/posts/tiny-decode-p0) | [phase0](https://github.com/jespiron/tiny-decode/tree/jess/phase0) |
-| 1 | [Inference Engines 1/N: KV Cache](url) | [phase1](url) |
+| 1 | [Inference Engines 1/N: KV Cache](https://jessicaruan.com/posts/tiny-decode-p1) | [phase1](https://github.com/jespiron/tiny-decode/tree/jess/phase1) |
