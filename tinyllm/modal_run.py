@@ -23,8 +23,7 @@ image = (
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
 app = modal.App("tiny-decode-step6")
 
-MODEL_NAME = "gpt2"
-
+MODEL_NAME = "Qwen/Qwen3-4B"
 
 @app.function(
     image=image,
@@ -87,10 +86,10 @@ def main(
 
 
 SWEEP_CONFIGS: list[tuple[str, int]] = [
-    ("The transformer architecture revolutionized NLP because", 8),
     ("The transformer architecture revolutionized NLP because", 32),
     ("The transformer architecture revolutionized NLP because", 128),
     ("The transformer architecture revolutionized NLP because", 512),
+    ("The transformer architecture revolutionized NLP because", 1024),
 ]
 
 
