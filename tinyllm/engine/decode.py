@@ -18,7 +18,7 @@ def generate(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        out = lm.model(input_ids=input_ids, use_cache=True)
+        out = lm.model(input_ids=input_ids, use_cache=False)
         next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         input_ids = torch.cat([input_ids, next_id], dim=1)
 
