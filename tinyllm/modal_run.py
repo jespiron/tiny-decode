@@ -21,7 +21,7 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase2-step2")
+app = modal.App("tiny-decode-phase2-step3")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
 
@@ -32,7 +32,9 @@ MODEL_NAME = "Qwen/Qwen3-4B"
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_remote(prompts: list[str], max_new_tokens: int, warmup: int, runs: int) -> dict:
+def run_remote(
+    prompts: list[str], max_new_tokens: int, max_running: int, warmup: int, runs: int
+) -> dict:
     from engine.decode import generate_batch
     from engine.model import load
     from harness.bench import run_batch_benchmark, to_dict
@@ -40,9 +42,15 @@ def run_remote(prompts: list[str], max_new_tokens: int, warmup: int, runs: int) 
     lm = load(MODEL_NAME)
 
     def gen():
-        return generate_batch(lm, prompts, max_new_tokens=max_new_tokens,
-                              eos_token_ids=lm.eos_token_ids)
+        return generate_batch(
+            lm, prompts, max_new_tokens=max_new_tokens,
+            max_running=max_running, eos_token_ids=lm.eos_token_ids,
+        )
 
+    # batch_size=len(prompts) overcounts tokens_per_sec for continuous batching:
+    # each step() advances at most max_running sequences, not len(prompts).
+    # Precise counting requires eos_decode_step from generate_batch's third
+    # return value; deferred to a dedicated benchmark in a later phase.
     result = run_batch_benchmark(
         generate_fn=gen,
         model_name=lm.name,
@@ -60,45 +68,52 @@ def run_remote(prompts: list[str], max_new_tokens: int, warmup: int, runs: int) 
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_waste_remote(prompts: list[str], max_new_tokens: int) -> dict:
-    from engine.decode import generate_batch
+def run_latency_remote(
+    prompts: list[str], max_new_tokens: int, max_running: int
+) -> dict:
     from engine.model import format_prompt, load
+    from engine.scheduler import Scheduler
 
     lm = load(MODEL_NAME)
-
     formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
 
-    texts, per_step, eos_decode_step = generate_batch(
-        lm, formatted, max_new_tokens=max_new_tokens,
+    sched = Scheduler(
+        lm, formatted,
+        max_new_tokens=max_new_tokens,
+        max_running=max_running,
         eos_token_ids=lm.eos_token_ids,
     )
+    sched.run()
 
-    previews = []
-    for text in texts:
-        response = text.rsplit("\nassistant\n", 1)[-1] if "\nassistant\n" in text else text
-        previews.append(response[:80].replace("\n", " ").strip())
+    t0 = min(s.submitted_at for s in sched.finished)
+    rows = []
+    for s in sched.finished:
+        response = s.text.rsplit("\nassistant\n", 1)[-1] if "\nassistant\n" in s.text else s.text
+        rows.append({
+            "seq_id": s.seq_id,
+            "started_ms": (s.started_at - t0) * 1000,
+            "finished_ms": (s.finished_at - t0) * 1000,
+            "latency_ms": (s.finished_at - s.submitted_at) * 1000,
+            "eos_decode_step": s.eos_decode_step,
+            "preview": response[:80].replace("\n", " ").strip(),
+        })
 
-    return {
-        "previews": previews,
-        "eos_decode_step": eos_decode_step,
-        "total_decode_steps": len(per_step) - 1,
-    }
+    return {"rows": rows, "total_ms": (max(s.finished_at for s in sched.finished) - t0) * 1000}
 
 
 @app.local_entrypoint()
 def main(
     prompt: str = "The transformer architecture revolutionized NLP because",
     max_new_tokens: int = 128,
-    batch_size: int = 1,
     warmup: int = 1,
     runs: int = 3,
     check: bool = False,
 ):
     import sys
 
-    prompts = [prompt] * batch_size
     out = run_remote.remote(
-        prompts=prompts, max_new_tokens=max_new_tokens, warmup=warmup, runs=runs
+        prompts=[prompt], max_new_tokens=max_new_tokens,
+        max_running=1, warmup=warmup, runs=runs,
     )
     r = out["result"]
 
@@ -125,74 +140,53 @@ def main(
     print(f"  peak memory: {r['peak_memory_mb']:.0f} MB")
 
 
-SWEEP_PROMPT = "The transformer architecture revolutionized NLP because"
-SWEEP_NEW_TOKENS = 128
-SWEEP_BATCH_SIZES = [1, 2, 4, 8, 16]
-
-
-@app.local_entrypoint()
-def sweep(warmup: int = 1, runs: int = 3):
-    rows = []
-    for bs in SWEEP_BATCH_SIZES:
-        prompts = [SWEEP_PROMPT] * bs
-        out = run_remote.remote(
-            prompts=prompts,
-            max_new_tokens=SWEEP_NEW_TOKENS,
-            warmup=warmup,
-            runs=runs,
-        )
-        rows.append(out["result"])
-
-    print()
-    print(f"model={MODEL_NAME}  new_tokens={SWEEP_NEW_TOKENS}  runs={runs}")
-    print()
-    print("| batch_size | tok/s (total) | ms/tok (per seq) | TTFT (ms) | Peak MB |")
-    print("|---:|---:|---:|---:|---:|")
-    for r in rows:
-        print(
-            f"| {r['batch_size']} | {r['tokens_per_sec']:.1f} "
-            f"| {r['ms_per_token']:.2f} | {r['ttft_ms']:.1f} "
-            f"| {r['peak_memory_mb']:.0f} |"
-        )
-
-
-WASTE_DEMO_PROMPTS = [
+# Mixed prompts: alternating short (factual) and long (generative) to make
+# the latency difference between static and continuous batching visible.
+LATENCY_DEMO_PROMPTS = [
     "What is the capital of France?",
     "Explain in detail how the attention mechanism works in a transformer.",
     "Is Python interpreted or compiled? Answer in one sentence.",
     "Write a short story about a robot who learns to paint.",
+    "What is 2 + 2?",
+    "Describe the history of the Roman Empire in significant detail.",
+    "Name one fruit.",
+    "What are the key differences between supervised and unsupervised learning?",
 ]
-WASTE_DEMO_MAX_TOKENS = 200
+LATENCY_DEMO_MAX_RUNNING = 4
+LATENCY_DEMO_MAX_TOKENS = 200
 
 
 @app.local_entrypoint()
-def waste_demo():
-    out = run_waste_remote.remote(
-        prompts=WASTE_DEMO_PROMPTS, max_new_tokens=WASTE_DEMO_MAX_TOKENS
+def latency_demo(
+    max_running: int = LATENCY_DEMO_MAX_RUNNING,
+    max_new_tokens: int = LATENCY_DEMO_MAX_TOKENS,
+):
+    prompts = LATENCY_DEMO_PROMPTS
+    out = run_latency_remote.remote(
+        prompts=prompts, max_new_tokens=max_new_tokens, max_running=max_running
     )
-    previews = out["previews"]
-    eos_steps = out["eos_decode_step"]
-    total = out["total_decode_steps"]
+    rows = out["rows"]
+    total_ms = out["total_ms"]
 
     print()
-    print(f"model={MODEL_NAME}  max_new_tokens={WASTE_DEMO_MAX_TOKENS}")
-    print(f"batch ran for {total} decode steps total")
+    print(f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  max_running={max_running}")
+    print(f"total prompts={len(prompts)}  total wall time={total_ms:.0f} ms")
     print()
-    print(f"{'prompt':<52} {'needed':>7} {'wasted':>7} {'waste%':>7}")
-    print("-" * 76)
 
-    total_wasted = 0
-    for prompt, eos, preview in zip(WASTE_DEMO_PROMPTS, eos_steps, previews):
-        needed = eos + 1
-        wasted = total - needed
-        total_wasted += wasted
-        short_prompt = prompt if len(prompt) <= 50 else prompt[:47] + "..."
-        print(f"{short_prompt:<52} {needed:>7} {wasted:>7} {100*wasted/total:>6.1f}%")
-        print(f"  → {preview!r}")
-
-    overall_waste = total_wasted / (len(WASTE_DEMO_PROMPTS) * total)
+    header = f"{'seq':>4}  {'started':>8}  {'finished':>9}  {'latency':>9}  {'steps':>6}  preview"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        short = LATENCY_DEMO_PROMPTS[r["seq_id"]]
+        short = short if len(short) <= 38 else short[:35] + "..."
+        print(
+            f"{r['seq_id']:>4}  "
+            f"{r['started_ms']:>7.0f}ms  "
+            f"{r['finished_ms']:>8.0f}ms  "
+            f"{r['latency_ms']:>8.0f}ms  "
+            f"{r['eos_decode_step']:>6}  "
+            f"{r['preview'][:40]!r}"
+        )
     print()
-    print(f"overall waste: {total_wasted} / {len(WASTE_DEMO_PROMPTS) * total} "
-          f"steps = {100 * overall_waste:.1f}%")
-    print()
-    print("These are the steps that continuous batching reclaims.")
+    print("Short requests (seq 0, 2, 4, 6) finish early and free slots for the next waiting")
+    print("sequence. With static batching they would have waited for the batch's slowest sequence.")
