@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import torch
+from transformers import DynamicCache
 
 from .model import LoadedModel
 
@@ -68,13 +69,15 @@ class Scheduler:
             seq.started_at = time.perf_counter()
             self.running.append(seq)
 
+    @torch.inference_mode()
     def _prefill_seq(self, seq: Sequence) -> None:
         tok = self.lm.tokenizer
         enc = tok([seq.prompt], return_tensors="pt", padding=False)
         input_ids = enc.input_ids.to(self.lm.device)
         attn_mask = enc.attention_mask.to(self.lm.device)
 
-        out = self.lm.model(input_ids=input_ids, attention_mask=attn_mask, use_cache=True)
+        out = self.lm.model(input_ids=input_ids, attention_mask=attn_mask,
+                            past_key_values=DynamicCache(), use_cache=True)
         seq.kv_cache = out.past_key_values
         next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [1, 1]
         seq.all_ids = torch.cat([input_ids, next_id], dim=1)
@@ -91,6 +94,7 @@ class Scheduler:
             seq.eos_decode_step = self.max_new_tokens  # sentinel
             seq.status = Status.DECODING
 
+    @torch.inference_mode()
     def _decode_seq(self, seq: Sequence) -> None:
         last_id = seq.all_ids[:, -1:]  # [1, 1]
         out = self.lm.model(
@@ -128,7 +132,7 @@ class Scheduler:
         torch.cuda.synchronize()
         self.per_step_seconds.append(time.perf_counter() - t0)
 
-        # retire finished sequences and immediately fill their slots
+        # Retire finished sequences and immediately fill their slots.
         now = time.perf_counter()
         done = [s for s in self.running if s.status == Status.DONE]
         for s in done:

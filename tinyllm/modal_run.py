@@ -21,10 +21,34 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase2-step3")
+app = modal.App("tiny-decode-phase2-step4")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
 
+# Module-level cache so warm container reuse doesn't reload the model.
+# Modal keeps containers alive between calls; without this each invocation
+# would load a fresh copy on top of the still-live previous one.
+_loaded: dict = {}
+
+SHORT_PROMPTS = [
+    "What is the capital of France?",
+    "Is Python interpreted or compiled? Answer in one sentence.",
+    "What is 2 + 2?",
+    "Name one fruit.",
+]
+LONG_PROMPTS = [
+    "Explain in detail how the attention mechanism works in a transformer.",
+    "Write a short story about a robot who learns to paint.",
+    "Describe the history of the Roman Empire in significant detail.",
+    "What are the key differences between supervised and unsupervised learning?",
+]
+
+# interleave short and long prompts, cycling as needed.
+# ensures that every batch contains both short and long sequences
+def mixed_prompts(n: int) -> list[str]:
+    pool = [p for pair in zip(SHORT_PROMPTS, LONG_PROMPTS) for p in pair]
+    return [pool[i % len(pool)] for i in range(n)]
+
 
 @app.function(
     image=image,
@@ -32,34 +56,54 @@ MODEL_NAME = "Qwen/Qwen3-4B"
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_remote(
-    prompts: list[str], max_new_tokens: int, max_running: int, warmup: int, runs: int
+def run_throughput_remote(
+    batch_size: int, max_new_tokens: int, warmup: int, runs: int
 ) -> dict:
-    from engine.decode import generate_batch
-    from engine.model import load
+    import gc
+
+    import torch
+    from engine.decode import generate_batch as static_gen_batch
+    from engine.scheduler import Scheduler
     from harness.bench import run_batch_benchmark, to_dict
 
-    lm = load(MODEL_NAME)
+    if "lm" not in _loaded:
+        from engine.model import load
+        _loaded["lm"] = load(MODEL_NAME)
+    lm = _loaded["lm"]
 
-    def gen():
-        return generate_batch(
-            lm, prompts, max_new_tokens=max_new_tokens,
-            max_running=max_running, eos_token_ids=lm.eos_token_ids,
-        )
+    prompt = "The transformer architecture revolutionized NLP because"
+    prompts = [prompt] * batch_size
 
-    # batch_size=len(prompts) overcounts tokens_per_sec for continuous batching:
-    # each step() advances at most max_running sequences, not len(prompts).
-    # Precise counting requires eos_decode_step from generate_batch's third
-    # return value; deferred to a dedicated benchmark in a later phase.
-    result = run_batch_benchmark(
-        generate_fn=gen,
+    # --- Static ---
+    def static_gen():
+        return static_gen_batch(lm, prompts, max_new_tokens, lm.eos_token_ids)
+
+    static_result = run_batch_benchmark(
+        generate_fn=static_gen,
         model_name=lm.name,
-        batch_size=len(prompts),
+        batch_size=batch_size,
         warmup=warmup,
         runs=runs,
     )
-    texts, _, _ = gen()
-    return {"texts": texts, "result": to_dict(result)}
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # --- Continuous (max_running = batch_size, same prompts, same concurrency) ---
+    # batch_size=len(prompts) overcounts tok/s for continuous; noted here and
+    # addressed in a later phase with precise per-sequence accounting.
+    def continuous_gen():
+        return Scheduler(lm, prompts, max_new_tokens, batch_size, lm.eos_token_ids).run()
+
+    continuous_result = run_batch_benchmark(
+        generate_fn=continuous_gen,
+        model_name=lm.name,
+        batch_size=batch_size,
+        warmup=warmup,
+        runs=runs,
+    )
+
+    return {"static": to_dict(static_result), "continuous": to_dict(continuous_result)}
 
 
 @app.function(
@@ -68,92 +112,91 @@ def run_remote(
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_latency_remote(
-    prompts: list[str], max_new_tokens: int, max_running: int
-) -> dict:
-    from engine.model import format_prompt, load
+def run_latency_remote(max_new_tokens: int, max_running: int) -> dict:
+    import time
+
+    import torch
+    from engine.decode import generate_batch as static_gen_batch
+    from engine.model import format_prompt
     from engine.scheduler import Scheduler
 
-    lm = load(MODEL_NAME)
+    if "lm" not in _loaded:
+        from engine.model import load
+        _loaded["lm"] = load(MODEL_NAME)
+    lm = _loaded["lm"]
+    print(f"[latency] model mem={torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
+    prompts = mixed_prompts(max_running * 2)
     formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
+    n = len(formatted)
 
-    sched = Scheduler(
-        lm, formatted,
-        max_new_tokens=max_new_tokens,
-        max_running=max_running,
-        eos_token_ids=lm.eos_token_ids,
-    )
+    # --- Static: process in sequential batches of max_running ---
+    static_rows = []
+    cumulative_ms = 0.0
+    for start in range(0, n, max_running):
+        batch = formatted[start : start + max_running]
+        _, per_step, eos_steps = static_gen_batch(lm, batch, max_new_tokens, lm.eos_token_ids)
+        batch_ms = sum(per_step) * 1000
+        cumulative_ms += batch_ms
+        for i, eos in enumerate(eos_steps):
+            static_rows.append(
+                {"seq_id": start + i, "latency_ms": cumulative_ms, "eos_decode_step": eos}
+            )
+
+    # --- Continuous ---
+    sched = Scheduler(lm, formatted, max_new_tokens, max_running, lm.eos_token_ids)
     sched.run()
-
     t0 = min(s.submitted_at for s in sched.finished)
-    rows = []
-    for s in sched.finished:
-        response = s.text.rsplit("\nassistant\n", 1)[-1] if "\nassistant\n" in s.text else s.text
-        rows.append({
+    sched.finished.sort(key=lambda s: s.seq_id)
+    continuous_rows = [
+        {
             "seq_id": s.seq_id,
+            "latency_ms": (s.finished_at - t0) * 1000,
             "started_ms": (s.started_at - t0) * 1000,
-            "finished_ms": (s.finished_at - t0) * 1000,
-            "latency_ms": (s.finished_at - s.submitted_at) * 1000,
             "eos_decode_step": s.eos_decode_step,
-            "preview": response[:80].replace("\n", " ").strip(),
-        })
+        }
+        for s in sched.finished
+    ]
 
-    return {"rows": rows, "total_ms": (max(s.finished_at for s in sched.finished) - t0) * 1000}
+    return {
+        "prompts": prompts,
+        "static_rows": static_rows,
+        "continuous_rows": continuous_rows,
+        "static_total_ms": cumulative_ms,
+        "continuous_total_ms": (max(s.finished_at for s in sched.finished) - t0) * 1000,
+    }
+
+
+SWEEP_BATCH_SIZES = [1, 2, 4, 8, 16]
+SWEEP_NEW_TOKENS = 64  # 256 gets OOM'd at batch >= 16 on an A10G (24 GB) with Qwen3-4B........
 
 
 @app.local_entrypoint()
-def main(
-    prompt: str = "The transformer architecture revolutionized NLP because",
-    max_new_tokens: int = 128,
-    warmup: int = 1,
-    runs: int = 3,
-    check: bool = False,
-):
-    import sys
-
-    out = run_remote.remote(
-        prompts=[prompt], max_new_tokens=max_new_tokens,
-        max_running=1, warmup=warmup, runs=runs,
-    )
-    r = out["result"]
-
-    if check:
-        from harness.snapshot import check_or_write
-
-        passed, msg = check_or_write(
-            model=MODEL_NAME,
-            prompt=prompt,
-            n_tokens=max_new_tokens,
-            text=out["texts"][0],
-            write=False,
+def sweep(warmup: int = 1, runs: int = 3):
+    rows = []
+    for bs in SWEEP_BATCH_SIZES:
+        out = run_throughput_remote.remote(
+            batch_size=bs, max_new_tokens=SWEEP_NEW_TOKENS, warmup=warmup, runs=runs
         )
-        print(f"\n[snapshot] {msg}")
-        if not passed:
-            sys.exit(1)
+        rows.append((bs, out["static"], out["continuous"]))
 
-    print(out["texts"][0])
     print()
-    print(f"model={r['model']}  batch_size={r['batch_size']}  runs={r['runs']}")
-    print(f"  tokens/sec:  {r['tokens_per_sec']:.1f}  (total across batch)")
-    print(f"  ms/token:    {r['ms_per_token']:.2f}  (per sequence, decode)")
-    print(f"  TTFT:        {r['ttft_ms']:.1f} ms")
-    print(f"  peak memory: {r['peak_memory_mb']:.0f} MB")
+    print(f"model={MODEL_NAME}  new_tokens={SWEEP_NEW_TOKENS}  runs={runs}")
+    print()
+    print(
+        "| batch_size | static tok/s | continuous tok/s "
+        "| static ms/tok | continuous ms/tok |"
+    )
+    print("|---:|---:|---:|---:|---:|")
+    for bs, s, c in rows:
+        print(
+            f"| {bs} "
+            f"| {s['tokens_per_sec']:.1f} | {c['tokens_per_sec']:.1f} "
+            f"| {s['ms_per_token']:.2f} | {c['ms_per_token']:.2f} |"
+        )
 
 
-# Mixed prompts: alternating short (factual) and long (generative) to make
-# the latency difference between static and continuous batching visible.
-LATENCY_DEMO_PROMPTS = [
-    "What is the capital of France?",
-    "Explain in detail how the attention mechanism works in a transformer.",
-    "Is Python interpreted or compiled? Answer in one sentence.",
-    "Write a short story about a robot who learns to paint.",
-    "What is 2 + 2?",
-    "Describe the history of the Roman Empire in significant detail.",
-    "Name one fruit.",
-    "What are the key differences between supervised and unsupervised learning?",
-]
 LATENCY_DEMO_MAX_RUNNING = 4
-LATENCY_DEMO_MAX_TOKENS = 200
+LATENCY_DEMO_MAX_TOKENS = 2048
 
 
 @app.local_entrypoint()
@@ -161,32 +204,47 @@ def latency_demo(
     max_running: int = LATENCY_DEMO_MAX_RUNNING,
     max_new_tokens: int = LATENCY_DEMO_MAX_TOKENS,
 ):
-    prompts = LATENCY_DEMO_PROMPTS
     out = run_latency_remote.remote(
-        prompts=prompts, max_new_tokens=max_new_tokens, max_running=max_running
+        max_new_tokens=max_new_tokens, max_running=max_running
     )
-    rows = out["rows"]
-    total_ms = out["total_ms"]
+
+    prompts = out["prompts"]
+    static_rows = {r["seq_id"]: r for r in out["static_rows"]}
+    continuous_rows = {r["seq_id"]: r for r in out["continuous_rows"]}
 
     print()
-    print(f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  max_running={max_running}")
-    print(f"total prompts={len(prompts)}  total wall time={total_ms:.0f} ms")
+    print(
+        f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  "
+        f"max_running={max_running}  total_prompts={len(prompts)}"
+    )
+    print(
+        f"static total={out['static_total_ms']:.0f} ms  "
+        f"continuous total={out['continuous_total_ms']:.0f} ms"
+    )
     print()
 
-    header = f"{'seq':>4}  {'started':>8}  {'finished':>9}  {'latency':>9}  {'steps':>6}  preview"
+    header = f"{'seq':>4}  {'prompt':<38}  {'static ms':>10}  {'cont ms':>10}  {'steps':>6}  {'speedup':>8}"
     print(header)
     print("-" * len(header))
-    for r in rows:
-        short = LATENCY_DEMO_PROMPTS[r["seq_id"]]
-        short = short if len(short) <= 38 else short[:35] + "..."
+
+    for i, prompt in enumerate(prompts):
+        s = static_rows[i]
+        c = continuous_rows[i]
+        short = prompt if len(prompt) <= 36 else prompt[:33] + "..."
+        speedup = s["latency_ms"] / c["latency_ms"] if c["latency_ms"] > 0 else 0
         print(
-            f"{r['seq_id']:>4}  "
-            f"{r['started_ms']:>7.0f}ms  "
-            f"{r['finished_ms']:>8.0f}ms  "
-            f"{r['latency_ms']:>8.0f}ms  "
-            f"{r['eos_decode_step']:>6}  "
-            f"{r['preview'][:40]!r}"
+            f"{i:>4}  {short:<38}  "
+            f"{s['latency_ms']:>9.0f}ms  "
+            f"{c['latency_ms']:>9.0f}ms  "
+            f"{c['eos_decode_step']:>6}  "
+            f"{speedup:>7.1f}×"
         )
+
     print()
-    print("Short requests (seq 0, 2, 4, 6) finish early and free slots for the next waiting")
-    print("sequence. With static batching they would have waited for the batch's slowest sequence.")
+    short_ids = [i for i in range(len(prompts)) if i % 2 == 0]
+    avg_static = sum(static_rows[i]["latency_ms"] for i in short_ids) / len(short_ids)
+    avg_cont = sum(continuous_rows[i]["latency_ms"] for i in short_ids) / len(short_ids)
+    print(
+        f"short-request avg latency:  static={avg_static:.0f} ms  "
+        f"continuous={avg_cont:.0f} ms  ({avg_static/avg_cont:.1f}× improvement)"
+    )
