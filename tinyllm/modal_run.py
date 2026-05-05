@@ -21,7 +21,7 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase2-step1")
+app = modal.App("tiny-decode-phase2-step2")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
 
@@ -66,8 +66,6 @@ def run_waste_remote(prompts: list[str], max_new_tokens: int) -> dict:
 
     lm = load(MODEL_NAME)
 
-    # format_prompt applies the instruction-turn template so the model gives
-    # a real answer and stops naturally. See engine/model.py for details.
     formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
 
     texts, per_step, eos_decode_step = generate_batch(
@@ -75,7 +73,6 @@ def run_waste_remote(prompts: list[str], max_new_tokens: int) -> dict:
         eos_token_ids=lm.eos_token_ids,
     )
 
-    # extract just the assistant response for display
     previews = []
     for text in texts:
         response = text.rsplit("\nassistant\n", 1)[-1] if "\nassistant\n" in text else text
