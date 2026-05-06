@@ -1,3 +1,5 @@
+from math import ceil
+
 import modal
 
 image = (
@@ -21,10 +23,11 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase3-step1")
+app = modal.App("tiny-decode-phase3-step2")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
-MAX_SEQ_LEN = 2048  # pre-allocation budget per sequence slot
+BLOCK_SIZE = 16
+MAX_SEQ_LEN = 2048
 
 _loaded: dict = {}
 
@@ -47,94 +50,19 @@ def mixed_prompts(n: int) -> list[str]:
     return [pool[i % len(pool)] for i in range(n)]
 
 
-def static_kv_gib_formula(model, max_running: int, max_seq_len: int) -> float:
-    """Theoretical KV cost if every active slot pre-allocates max_seq_len tokens.
-
-    KV per token = 2 (K + V) × n_kv_heads × head_dim × 2 bytes (fp16)
-    Summed over all layers and all concurrent sequence slots.
-    """
-    cfg = model.config
-    head_dim = cfg.hidden_size // cfg.num_attention_heads
-    kv_bytes = (
-        max_running
-        * max_seq_len
-        * cfg.num_hidden_layers
-        * 2                         # K and V
-        * cfg.num_key_value_heads
-        * head_dim
-        * 2                         # fp16
-    )
-    return kv_bytes / 1024**3
-
-
 @app.function(
     image=image,
     gpu="A10G",
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_wall_remote(max_running: int, max_seq_len: int) -> dict:
-    """Run DynamicScheduler; return measured dynamic KV usage alongside formula-based static cost.
-
-    static_kv_gib:  what a static pre-allocator would commit (max_running × max_seq_len × kv dims)
-    dynamic_kv_gib: peak KV overhead actually measured during the DynamicCache run
-    """
+def run_alloc_demo(max_running: int, max_seq_len: int, block_size: int) -> dict:
+    """Run DynamicScheduler and report per-sequence block usage."""
     import torch
 
     from engine.model import format_prompt, load
     from engine.scheduler import DynamicScheduler
-
-    if "lm" not in _loaded:
-        _loaded["lm"] = load(MODEL_NAME)
-    lm = _loaded["lm"]
-
-    model_gib = torch.cuda.memory_allocated() / 1024**3
-    prompts = mixed_prompts(max_running * 2)
-    formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
-
-    torch.cuda.reset_peak_memory_stats()
-    try:
-        sched = DynamicScheduler(lm, formatted, max_seq_len, max_running, lm.eos_token_ids)
-        sched.run()
-    except torch.cuda.OutOfMemoryError:
-        return {
-            "max_running": max_running,
-            "max_seq_len": max_seq_len,
-            "model_gib": model_gib,
-            "static_kv_gib": static_kv_gib_formula(lm.model, max_running, max_seq_len),
-            "dynamic_kv_gib": None,
-            "oom": True,
-        }
-
-    peak_gib = torch.cuda.max_memory_allocated() / 1024**3
-    dynamic_kv_gib = peak_gib - model_gib
-    actual_tokens = [s.eos_decode_step + 1 for s in sched.finished]
-    avg_actual = sum(actual_tokens) / len(actual_tokens)
-
-    return {
-        "max_running": max_running,
-        "max_seq_len": max_seq_len,
-        "model_gib": model_gib,
-        "static_kv_gib": static_kv_gib_formula(lm.model, max_running, max_seq_len),
-        "dynamic_kv_gib": dynamic_kv_gib,
-        "avg_actual_tokens": avg_actual,
-        "wasted_fraction": 1.0 - avg_actual / max_seq_len,
-        "oom": False,
-    }
-
-
-@app.function(
-    image=image,
-    gpu="A10G",
-    volumes={"/cache": hf_cache},
-    timeout=1800,
-)
-def run_waste_remote(max_running: int, max_seq_len: int) -> dict:
-    """Run mixed prompts; return per-sequence token usage vs pre-allocation."""
-    import torch
-
-    from engine.model import format_prompt, load
-    from engine.scheduler import DynamicScheduler
+    from engine.kv_cache import BlockAllocator
 
     if "lm" not in _loaded:
         _loaded["lm"] = load(MODEL_NAME)
@@ -145,109 +73,85 @@ def run_waste_remote(max_running: int, max_seq_len: int) -> dict:
 
     sched = DynamicScheduler(lm, formatted, max_seq_len, max_running, lm.eos_token_ids)
     sched.run()
-
     sched.finished.sort(key=lambda s: s.seq_id)
-    rows = [
-        {
-            "seq_id": s.seq_id,
-            "actual_tokens": s.eos_decode_step + 1,
-            "allocated_tokens": max_seq_len,
-            "utilisation": (s.eos_decode_step + 1) / max_seq_len,
-        }
-        for s in sched.finished
-    ]
 
-    # Static model: each slot holds max_seq_len regardless of actual usage.
-    # With continuous batching + 2×max_running prompts, each slot is occupied
-    # twice on average, so total allocation = 2 × max_running × max_seq_len.
-    total_actual = sum(r["actual_tokens"] for r in rows)
-    total_alloc = 2 * max_running * max_seq_len
+    # Total KV tokens per sequence (prompt + generated).
+    total_tokens = [s.all_ids.shape[1] for s in sched.finished]
+    prompts_used = [s.prompt for s in sched.finished]
+
+    # How many blocks each sequence would have needed with a block allocator.
+    blocks_used = [ceil(t / block_size) for t in total_tokens]
+    # How many blocks static pre-allocation reserves per slot.
+    blocks_static = ceil(max_seq_len / block_size)
+
+    # Peak concurrent blocks: at any moment up to max_running sequences are
+    # active. The peak happens when all active slots are at their busiest.
+    # We approximate: mean blocks per active sequence × max_running.
+    avg_blocks = sum(blocks_used) / len(blocks_used)
+    peak_paged_approx = round(avg_blocks * max_running)
+    peak_static = blocks_static * max_running
+
+    n_blocks = BlockAllocator.budget_n_blocks(lm.model, block_size)
+
     return {
-        "rows": rows,
-        "prompts": prompts,
-        "total_actual_tokens": total_actual,
-        "total_allocated_tokens": total_alloc,
-        "overall_utilisation": total_actual / total_alloc,
-        "static_kv_gib": static_kv_gib_formula(lm.model, max_running, max_seq_len),
+        "max_running": max_running,
+        "max_seq_len": max_seq_len,
+        "block_size": block_size,
+        "n_blocks_available": n_blocks,
+        "blocks_static_per_slot": blocks_static,
+        "peak_static": peak_static,
+        "peak_paged_approx": peak_paged_approx,
+        "avg_blocks_per_seq": avg_blocks,
+        "sequences": [
+            {
+                "seq_id": s.seq_id,
+                "prompt": prompts_used[i][:50],
+                "total_tokens": total_tokens[i],
+                "blocks_used": blocks_used[i],
+                "blocks_static": blocks_static,
+                "waste_pct": 1.0 - blocks_used[i] / blocks_static,
+            }
+            for i, s in enumerate(sched.finished)
+        ],
     }
 
 
-WALL_MAX_RUNNING_VALUES = [1, 2, 4, 8, 16, 32]
-
-
 @app.local_entrypoint()
-def wall(max_seq_len: int = MAX_SEQ_LEN):
-    """Formula-based static KV cost vs measured DynamicCache usage as concurrency grows.
-
-    static_kv:  what a static pre-allocator must commit (max_running × max_seq_len × kv dims)
-    dynamic_kv: peak KV overhead actually used by DynamicCache (tracks actual tokens)
-    wasted:     fraction of the static budget never written (1 - avg_tok / max_seq_len)
-
-    PagedAttention target: dynamic_kv-level memory with static-level admission control.
-    """
-    print()
-    print(f"model={MODEL_NAME}  max_seq_len={max_seq_len}")
-    print()
-    header = (
-        f"{'concur':>6}  {'static_kv':>10}  {'dynamic_kv':>10}  "
-        f"{'avg_tok':>8}  {'wasted':>7}"
+def alloc_demo(
+    max_running: int = 8,
+    max_seq_len: int = MAX_SEQ_LEN,
+    block_size: int = BLOCK_SIZE,
+):
+    """Show per-sequence block usage vs static worst-case."""
+    out = run_alloc_demo.remote(
+        max_running=max_running,
+        max_seq_len=max_seq_len,
+        block_size=block_size,
     )
+
+    print()
+    print(
+        f"model={MODEL_NAME}  block_size={block_size}  "
+        f"max_seq_len={max_seq_len}  max_running={max_running}"
+    )
+    print(f"pool capacity: {out['n_blocks_available']} blocks available after model load")
+    print()
+
+    header = f"{'seq':>4}  {'prompt':<42}  {'tokens':>7}  {'blocks':>7}  {'static':>7}  {'waste':>6}"
     print(header)
     print("-" * len(header))
-
-    for max_running in WALL_MAX_RUNNING_VALUES:
-        out = run_wall_remote.remote(max_running=max_running, max_seq_len=max_seq_len)
-        if out["oom"]:
-            print(
-                f"{out['max_running']:>6}  "
-                f"{out['static_kv_gib']:>9.2f}G  "
-                f"{'(OOM)':>10}  "
-            )
-            break
+    for row in out["sequences"]:
         print(
-            f"{out['max_running']:>6}  "
-            f"{out['static_kv_gib']:>9.2f}G  "
-            f"{out['dynamic_kv_gib']:>9.2f}G  "
-            f"{out['avg_actual_tokens']:>7.1f}t  "
-            f"{out['wasted_fraction']:>6.1%}"
+            f"{row['seq_id']:>4}  {row['prompt']:<42}  "
+            f"{row['total_tokens']:>6}t  "
+            f"{row['blocks_used']:>6}b  "
+            f"{row['blocks_static']:>6}b  "
+            f"{row['waste_pct']:>5.1%}"
         )
 
-
-@app.local_entrypoint()
-def waste(max_running: int = 4, max_seq_len: int = MAX_SEQ_LEN):
-    """Per-sequence KV utilisation on mixed prompts."""
-    out = run_waste_remote.remote(max_running=max_running, max_seq_len=max_seq_len)
-
-    prompts = out["prompts"]
     print()
-    print(
-        f"model={MODEL_NAME}  max_running={max_running}  max_seq_len={max_seq_len}"
-    )
-    print(
-        f"static KV budget: {out['static_kv_gib']:.2f} GiB  "
-        f"(for {max_running} concurrent slots × {max_seq_len} tokens)"
-    )
-    print(
-        f"total tokens: actual={out['total_actual_tokens']}  "
-        f"allocated={out['total_allocated_tokens']}  "
-        f"utilisation={out['overall_utilisation']:.1%}"
-    )
-    print()
-    header = f"{'seq':>4}  {'prompt':<40}  {'actual':>7}  {'alloc':>6}  {'util':>6}"
-    print(header)
-    print("-" * len(header))
-    for r in out["rows"]:
-        short = prompts[r["seq_id"]]
-        short = short if len(short) <= 38 else short[:35] + "..."
-        print(
-            f"{r['seq_id']:>4}  {short:<40}  "
-            f"{r['actual_tokens']:>6}t  "
-            f"{r['allocated_tokens']:>5}t  "
-            f"{r['utilisation']:>5.1%}"
-        )
-    print()
-    wasted = 1.0 - out["overall_utilisation"]
-    print(
-        f"  {wasted:.1%} of pre-allocated KV was never written — "
-        f"PagedAttention eliminates this waste."
-    )
+    print(f"  static pre-allocation:  {out['peak_static']} blocks  "
+          f"({out['max_running']} slots × {out['blocks_static_per_slot']} blocks/slot)")
+    print(f"  paged (approx peak):    {out['peak_paged_approx']} blocks  "
+          f"(avg {out['avg_blocks_per_seq']:.1f} blocks/seq × {out['max_running']} concurrent)")
+    print(f"  reduction:              {out['peak_static'] / out['peak_paged_approx']:.1f}×")
