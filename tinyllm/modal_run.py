@@ -1,3 +1,5 @@
+import time
+
 import modal
 
 image = (
@@ -21,13 +23,13 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase2-step4")
+app = modal.App("tiny-decode-phase3-step5")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
+BLOCK_SIZE = 16
+MAX_NEW_TOKENS = 256
+CONCURRENCY_VALUES = [1, 2, 4, 8, 16, 32]
 
-# Module-level cache so warm container reuse doesn't reload the model.
-# Modal keeps containers alive between calls; without this each invocation
-# would load a fresh copy on top of the still-live previous one.
 _loaded: dict = {}
 
 SHORT_PROMPTS = [
@@ -43,208 +45,154 @@ LONG_PROMPTS = [
     "What are the key differences between supervised and unsupervised learning?",
 ]
 
-# interleave short and long prompts, cycling as needed.
-# ensures that every batch contains both short and long sequences
+
 def mixed_prompts(n: int) -> list[str]:
     pool = [p for pair in zip(SHORT_PROMPTS, LONG_PROMPTS) for p in pair]
     return [pool[i % len(pool)] for i in range(n)]
 
 
+# ---------------------------------------------------------------------------
+# Remote bench function
+# ---------------------------------------------------------------------------
+
 @app.function(
     image=image,
     gpu="A10G",
     volumes={"/cache": hf_cache},
     timeout=1800,
 )
-def run_throughput_remote(
-    batch_size: int, max_new_tokens: int, warmup: int, runs: int
-) -> dict:
+def run_bench_remote(max_running: int, max_new_tokens: int) -> dict:
+    """Run DynamicScheduler then PagedScheduler; return throughput + latency stats."""
     import gc
-
     import torch
-    from engine.decode import generate_batch as static_gen_batch
-    from engine.scheduler import Scheduler
-    from harness.bench import run_batch_benchmark, to_dict
+
+    from engine.model import format_prompt, load
+    from engine.kv_cache import BlockAllocator
+    from engine.scheduler import DynamicScheduler, PagedScheduler
 
     if "lm" not in _loaded:
-        from engine.model import load
         _loaded["lm"] = load(MODEL_NAME)
     lm = _loaded["lm"]
 
-    prompt = "The transformer architecture revolutionized NLP because"
-    prompts = [prompt] * batch_size
+    raw_prompts = mixed_prompts(max_running * 2)
+    prompts = [format_prompt(lm.tokenizer, p) for p in raw_prompts]
 
-    # --- Static ---
-    def static_gen():
-        return static_gen_batch(lm, prompts, max_new_tokens, lm.eos_token_ids)
-
-    static_result = run_batch_benchmark(
-        generate_fn=static_gen,
-        model_name=lm.name,
-        batch_size=batch_size,
-        warmup=warmup,
-        runs=runs,
+    cfg = lm.model.config
+    head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    bytes_per_block = (
+        cfg.num_hidden_layers * 2 * cfg.num_key_value_heads
+        * BLOCK_SIZE * head_dim * 2
     )
+
+    # ---- DynamicScheduler ----
+    dyn_oom = False
+    dyn_tps = 0.0
+    dyn_kv_gib = 0.0
+    try:
+        model_gib = torch.cuda.memory_allocated() / 1024**3
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        sched = DynamicScheduler(lm, prompts, max_new_tokens=max_new_tokens,
+                                 max_running=max_running, eos_token_ids=lm.eos_token_ids)
+        sched.run()
+        wall = time.perf_counter() - t0
+        total_tokens = sum(s.all_ids.shape[1] for s in sched.finished)
+        dyn_tps = total_tokens / wall
+        dyn_kv_gib = torch.cuda.max_memory_allocated() / 1024**3 - model_gib
+    except torch.cuda.OutOfMemoryError:
+        dyn_oom = True
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # --- Continuous (max_running = batch_size, same prompts, same concurrency) ---
-    # batch_size=len(prompts) overcounts tok/s for continuous; noted here and
-    # addressed in a later phase with precise per-sequence accounting.
-    def continuous_gen():
-        return Scheduler(lm, prompts, max_new_tokens, batch_size, lm.eos_token_ids).run()
+    # ---- PagedScheduler ----
+    paged_oom = False
+    paged_tps = 0.0
+    paged_kv_gib = 0.0
+    try:
+        n_blocks = BlockAllocator.budget_n_blocks(lm.model, BLOCK_SIZE)
+        allocator = BlockAllocator.from_model(lm.model, BLOCK_SIZE, n_blocks, lm.device, lm.dtype)
+        t0 = time.perf_counter()
+        sched = PagedScheduler(lm, prompts, allocator, max_new_tokens=max_new_tokens,
+                               max_running=max_running, eos_token_ids=lm.eos_token_ids)
+        sched.run()
+        wall = time.perf_counter() - t0
+        total_tokens = sum(s.all_ids.shape[1] for s in sched.finished)
+        paged_tps = total_tokens / wall
+        paged_kv_gib = allocator.peak_allocated * bytes_per_block / 1024**3
+        del allocator
+    except torch.cuda.OutOfMemoryError:
+        paged_oom = True
 
-    continuous_result = run_batch_benchmark(
-        generate_fn=continuous_gen,
-        model_name=lm.name,
-        batch_size=batch_size,
-        warmup=warmup,
-        runs=runs,
-    )
-
-    return {"static": to_dict(static_result), "continuous": to_dict(continuous_result)}
-
-
-@app.function(
-    image=image,
-    gpu="A10G",
-    volumes={"/cache": hf_cache},
-    timeout=1800,
-)
-def run_latency_remote(max_new_tokens: int, max_running: int) -> dict:
-    import time
-
-    import torch
-    from engine.decode import generate_batch as static_gen_batch
-    from engine.model import format_prompt
-    from engine.scheduler import Scheduler
-
-    if "lm" not in _loaded:
-        from engine.model import load
-        _loaded["lm"] = load(MODEL_NAME)
-    lm = _loaded["lm"]
-    print(f"[latency] model mem={torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
-    prompts = mixed_prompts(max_running * 2)
-    formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
-    n = len(formatted)
-
-    # --- Static: process in sequential batches of max_running ---
-    static_rows = []
-    cumulative_ms = 0.0
-    for start in range(0, n, max_running):
-        batch = formatted[start : start + max_running]
-        _, per_step, eos_steps = static_gen_batch(lm, batch, max_new_tokens, lm.eos_token_ids)
-        batch_ms = sum(per_step) * 1000
-        cumulative_ms += batch_ms
-        for i, eos in enumerate(eos_steps):
-            static_rows.append(
-                {"seq_id": start + i, "latency_ms": cumulative_ms, "eos_decode_step": eos}
-            )
-
-    # --- Continuous ---
-    sched = Scheduler(lm, formatted, max_new_tokens, max_running, lm.eos_token_ids)
-    sched.run()
-    t0 = min(s.submitted_at for s in sched.finished)
-    sched.finished.sort(key=lambda s: s.seq_id)
-    continuous_rows = [
-        {
-            "seq_id": s.seq_id,
-            "latency_ms": (s.finished_at - t0) * 1000,
-            "started_ms": (s.started_at - t0) * 1000,
-            "eos_decode_step": s.eos_decode_step,
-        }
-        for s in sched.finished
-    ]
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return {
-        "prompts": prompts,
-        "static_rows": static_rows,
-        "continuous_rows": continuous_rows,
-        "static_total_ms": cumulative_ms,
-        "continuous_total_ms": (max(s.finished_at for s in sched.finished) - t0) * 1000,
+        "max_running": max_running,
+        "dyn_tps": dyn_tps,
+        "dyn_kv_gib": dyn_kv_gib,
+        "dyn_oom": dyn_oom,
+        "paged_tps": paged_tps,
+        "paged_kv_gib": paged_kv_gib,
+        "paged_oom": paged_oom,
     }
 
 
-SWEEP_BATCH_SIZES = [1, 2, 4, 8, 16]
-SWEEP_NEW_TOKENS = 64  # 256 gets OOM'd at batch >= 16 on an A10G (24 GB) with Qwen3-4B........
-
-
-@app.local_entrypoint()
-def sweep(warmup: int = 1, runs: int = 3):
-    rows = []
-    for bs in SWEEP_BATCH_SIZES:
-        out = run_throughput_remote.remote(
-            batch_size=bs, max_new_tokens=SWEEP_NEW_TOKENS, warmup=warmup, runs=runs
-        )
-        rows.append((bs, out["static"], out["continuous"]))
-
-    print()
-    print(f"model={MODEL_NAME}  new_tokens={SWEEP_NEW_TOKENS}  runs={runs}")
-    print()
-    print(
-        "| batch_size | static tok/s | continuous tok/s "
-        "| static ms/tok | continuous ms/tok |"
-    )
-    print("|---:|---:|---:|---:|---:|")
-    for bs, s, c in rows:
-        print(
-            f"| {bs} "
-            f"| {s['tokens_per_sec']:.1f} | {c['tokens_per_sec']:.1f} "
-            f"| {s['ms_per_token']:.2f} | {c['ms_per_token']:.2f} |"
-        )
-
-
-LATENCY_DEMO_MAX_RUNNING = 4
-LATENCY_DEMO_MAX_TOKENS = 2048
-
+# ---------------------------------------------------------------------------
+# tput entrypoint
+# ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def latency_demo(
-    max_running: int = LATENCY_DEMO_MAX_RUNNING,
-    max_new_tokens: int = LATENCY_DEMO_MAX_TOKENS,
-):
-    out = run_latency_remote.remote(
-        max_new_tokens=max_new_tokens, max_running=max_running
-    )
+def tput(max_new_tokens: int = MAX_NEW_TOKENS):
+    """Total throughput and average per-token latency, dyn vs paged.
 
-    prompts = out["prompts"]
-    static_rows = {r["seq_id"]: r for r in out["static_rows"]}
-    continuous_rows = {r["seq_id"]: r for r in out["continuous_rows"]}
-
+    tok/s     = total tokens generated / wall time.  Comparable to
+                "total_tok/s" from phase2-step4's sweep table.
+    ms/tok    = 1000 / tok/s.  Comparable to "ms/tok (per seq)" from
+                phase2-step4 and the Phase 1 single-sequence baseline.
+                For sequential forward passes this is flat with concurrency;
+                the plateau here mirrors the ~23 tok/s plateau in phase2.
+    """
     print()
-    print(
-        f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  "
-        f"max_running={max_running}  total_prompts={len(prompts)}"
-    )
-    print(
-        f"static total={out['static_total_ms']:.0f} ms  "
-        f"continuous total={out['continuous_total_ms']:.0f} ms"
-    )
+    print(f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  block_size={BLOCK_SIZE}")
+    print(f"n_prompts = concur × 2  (mixed short + long)")
     print()
-
-    header = f"{'seq':>4}  {'prompt':<38}  {'static ms':>10}  {'cont ms':>10}  {'steps':>6}  {'speedup':>8}"
+    header = (
+        f"{'batch_size':>6}  "
+        f"{'dyn_tok/s':>10}  {'dyn_ms/tok':>11}  "
+        f"{'paged_tok/s':>12}  {'paged_ms/tok':>13}  "
+        f"{'dyn_kv':>7}  {'paged_kv':>8}"
+    )
     print(header)
     print("-" * len(header))
 
-    for i, prompt in enumerate(prompts):
-        s = static_rows[i]
-        c = continuous_rows[i]
-        short = prompt if len(prompt) <= 36 else prompt[:33] + "..."
-        speedup = s["latency_ms"] / c["latency_ms"] if c["latency_ms"] > 0 else 0
-        print(
-            f"{i:>4}  {short:<38}  "
-            f"{s['latency_ms']:>9.0f}ms  "
-            f"{c['latency_ms']:>9.0f}ms  "
-            f"{c['eos_decode_step']:>6}  "
-            f"{speedup:>7.1f}×"
-        )
+    for max_running in CONCURRENCY_VALUES:
+        out = run_bench_remote.remote(max_running=max_running, max_new_tokens=max_new_tokens)
 
-    print()
-    short_ids = [i for i in range(len(prompts)) if i % 2 == 0]
-    avg_static = sum(static_rows[i]["latency_ms"] for i in short_ids) / len(short_ids)
-    avg_cont = sum(continuous_rows[i]["latency_ms"] for i in short_ids) / len(short_ids)
-    print(
-        f"short-request avg latency:  static={avg_static:.0f} ms  "
-        f"continuous={avg_cont:.0f} ms  ({avg_static/avg_cont:.1f}× improvement)"
-    )
+        if out["dyn_oom"]:
+            dyn_tps_s = f"{'(OOM)':>10}"
+            dyn_ms_s  = f"{'--':>11}"
+            dyn_kv_s  = f"{'--':>7}"
+        else:
+            dyn_tps_s = f"{out['dyn_tps']:>9.1f}t/s"
+            dyn_ms_s  = f"{1000/out['dyn_tps']:>10.1f}ms"
+            dyn_kv_s  = f"{out['dyn_kv_gib']:>6.2f}G"
+
+        if out["paged_oom"]:
+            paged_tps_s = f"{'(OOM)':>12}"
+            paged_ms_s  = f"{'--':>13}"
+            paged_kv_s  = f"{'--':>8}"
+        else:
+            paged_tps_s = f"{out['paged_tps']:>11.1f}t/s"
+            paged_ms_s  = f"{1000/out['paged_tps']:>12.1f}ms"
+            paged_kv_s  = f"{out['paged_kv_gib']:>7.2f}G"
+
+        print(
+            f"{out['max_running']:>6}  "
+            f"{dyn_tps_s}  {dyn_ms_s}  "
+            f"{paged_tps_s}  {paged_ms_s}  "
+            f"{dyn_kv_s}  {paged_kv_s}"
+        )
+        if out["paged_oom"]:
+            break
+
