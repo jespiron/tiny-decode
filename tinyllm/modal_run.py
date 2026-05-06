@@ -1,5 +1,3 @@
-from math import ceil
-
 import modal
 
 image = (
@@ -23,135 +21,151 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase3-step2")
+app = modal.App("tiny-decode-phase3-step3")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
 BLOCK_SIZE = 16
-MAX_SEQ_LEN = 2048
+MAX_NEW_TOKENS = 60   # enough to cross a few block boundaries
 
 _loaded: dict = {}
-
-SHORT_PROMPTS = [
-    "What is the capital of France?",
-    "Is Python interpreted or compiled? Answer in one sentence.",
-    "What is 2 + 2?",
-    "Name one fruit.",
-]
-LONG_PROMPTS = [
-    "Explain in detail how the attention mechanism works in a transformer.",
-    "Write a short story about a robot who learns to paint.",
-    "Describe the history of the Roman Empire in significant detail.",
-    "What are the key differences between supervised and unsupervised learning?",
-]
-
-
-def mixed_prompts(n: int) -> list[str]:
-    pool = [p for pair in zip(SHORT_PROMPTS, LONG_PROMPTS) for p in pair]
-    return [pool[i % len(pool)] for i in range(n)]
 
 
 @app.function(
     image=image,
     gpu="A10G",
     volumes={"/cache": hf_cache},
-    timeout=1800,
+    timeout=600,
 )
-def run_alloc_demo(max_running: int, max_seq_len: int, block_size: int) -> dict:
-    """Run DynamicScheduler and report per-sequence block usage."""
+def run_table_demo(prompt: str, max_new_tokens: int, block_size: int) -> dict:
+    """Run one sequence; record block table snapshots at each block boundary."""
     import torch
+    from transformers import DynamicCache
 
     from engine.model import format_prompt, load
-    from engine.scheduler import DynamicScheduler
-    from engine.kv_cache import BlockAllocator
+    from engine.kv_cache import BlockAllocator, BlockTable
 
     if "lm" not in _loaded:
         _loaded["lm"] = load(MODEL_NAME)
     lm = _loaded["lm"]
 
-    prompts = mixed_prompts(max_running * 2)
-    formatted = [format_prompt(lm.tokenizer, p) for p in prompts]
+    tok = lm.tokenizer
+    formatted = format_prompt(tok, prompt)
+    enc = tok([formatted], return_tensors="pt", padding=False)
+    input_ids = enc.input_ids.to(lm.device)
+    attn_mask = enc.attention_mask.to(lm.device)
+    n_prompt = input_ids.shape[1]
 
-    sched = DynamicScheduler(lm, formatted, max_seq_len, max_running, lm.eos_token_ids)
-    sched.run()
-    sched.finished.sort(key=lambda s: s.seq_id)
+    # We build a BlockTable alongside the real DynamicCache.
+    # Allocator uses CPU (no GPU memory needed for the demo — we're only
+    # tracking the mapping, not storing KV data in it).
+    allocator = BlockAllocator(
+        n_blocks=256,
+        n_layers=lm.model.config.num_hidden_layers,
+        n_kv_heads=lm.model.config.num_key_value_heads,
+        block_size=block_size,
+        head_dim=lm.model.config.hidden_size // lm.model.config.num_attention_heads,
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+    )
+    table = BlockTable(block_size=block_size)
+    snapshots: list[dict] = []
 
-    # Total KV tokens per sequence (prompt + generated).
-    total_tokens = [s.all_ids.shape[1] for s in sched.finished]
-    prompts_used = [s.prompt for s in sched.finished]
+    def snapshot(label: str) -> None:
+        snapshots.append({
+            "label": label,
+            "n_filled": table.n_filled,
+            "blocks": table.describe(),
+        })
 
-    # How many blocks each sequence would have needed with a block allocator.
-    blocks_used = [ceil(t / block_size) for t in total_tokens]
-    # How many blocks static pre-allocation reserves per slot.
-    blocks_static = ceil(max_seq_len / block_size)
+    def advance_table(n_new_tokens: int) -> None:
+        for _ in range(n_new_tokens):
+            table.maybe_extend(allocator)
+            table.record_token()
+            # Snapshot at every block boundary.
+            if table.n_filled % block_size == 0:
+                snapshot(f"after token {table.n_filled}")
 
-    # Peak concurrent blocks: at any moment up to max_running sequences are
-    # active. The peak happens when all active slots are at their busiest.
-    # We approximate: mean blocks per active sequence × max_running.
-    avg_blocks = sum(blocks_used) / len(blocks_used)
-    peak_paged_approx = round(avg_blocks * max_running)
-    peak_static = blocks_static * max_running
+    # Prefill: n_prompt tokens enter the KV cache.
+    with torch.inference_mode():
+        out = lm.model(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            past_key_values=DynamicCache(),
+            use_cache=True,
+        )
+    kv = out.past_key_values
+    advance_table(n_prompt)
+    snapshot(f"after prefill ({n_prompt} prompt tokens)")
 
-    n_blocks = BlockAllocator.budget_n_blocks(lm.model, block_size)
+    # Decode: one token at a time.
+    eos_ids = torch.tensor(lm.eos_token_ids, device=lm.device)
+    all_ids = torch.cat([input_ids, out.logits[:, -1:, :].argmax(-1)], dim=1)
+
+    for step in range(max_new_tokens):
+        with torch.inference_mode():
+            out = lm.model(
+                input_ids=all_ids[:, -1:],
+                attention_mask=torch.ones(1, all_ids.shape[1], device=lm.device),
+                past_key_values=kv,
+                use_cache=True,
+            )
+        kv = out.past_key_values
+        next_id = out.logits[:, -1:, :].argmax(-1)
+        all_ids = torch.cat([all_ids, next_id], dim=1)
+        advance_table(1)
+
+        if torch.isin(next_id.squeeze(), eos_ids).item():
+            break
 
     return {
-        "max_running": max_running,
-        "max_seq_len": max_seq_len,
+        "prompt": prompt,
+        "n_prompt_tokens": n_prompt,
+        "n_generated": all_ids.shape[1] - n_prompt,
+        "total_tokens": all_ids.shape[1],
         "block_size": block_size,
-        "n_blocks_available": n_blocks,
-        "blocks_static_per_slot": blocks_static,
-        "peak_static": peak_static,
-        "peak_paged_approx": peak_paged_approx,
-        "avg_blocks_per_seq": avg_blocks,
-        "sequences": [
-            {
-                "seq_id": s.seq_id,
-                "prompt": prompts_used[i][:50],
-                "total_tokens": total_tokens[i],
-                "blocks_used": blocks_used[i],
-                "blocks_static": blocks_static,
-                "waste_pct": 1.0 - blocks_used[i] / blocks_static,
-            }
-            for i, s in enumerate(sched.finished)
-        ],
+        "snapshots": snapshots,
+        "final_blocks": table.describe(),
     }
 
 
 @app.local_entrypoint()
-def alloc_demo(
-    max_running: int = 8,
-    max_seq_len: int = MAX_SEQ_LEN,
+def table_demo(
     block_size: int = BLOCK_SIZE,
+    max_new_tokens: int = MAX_NEW_TOKENS,
 ):
-    """Show per-sequence block usage vs static worst-case."""
-    out = run_alloc_demo.remote(
-        max_running=max_running,
-        max_seq_len=max_seq_len,
+    prompt = "Explain how the attention mechanism works in a transformer model."
+    out = run_table_demo.remote(
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
         block_size=block_size,
     )
 
     print()
+    print(f"prompt: \"{out['prompt']}\"")
     print(
-        f"model={MODEL_NAME}  block_size={block_size}  "
-        f"max_seq_len={max_seq_len}  max_running={max_running}"
+        f"prompt tokens: {out['n_prompt_tokens']}  "
+        f"generated: {out['n_generated']}  "
+        f"total: {out['total_tokens']}  "
+        f"block_size: {out['block_size']}"
     )
-    print(f"pool capacity: {out['n_blocks_available']} blocks available after model load")
-    print()
 
-    header = f"{'seq':>4}  {'prompt':<42}  {'tokens':>7}  {'blocks':>7}  {'static':>7}  {'waste':>6}"
-    print(header)
-    print("-" * len(header))
-    for row in out["sequences"]:
+    for snap in out["snapshots"]:
+        print()
+        print(f"  [{snap['label']}]  ({snap['n_filled']} tokens in KV cache)")
+        print(f"  {'logical':>8}  {'physical':>9}  {'tokens':>14}  {'fill':>8}")
+        for b in snap["blocks"]:
+            print(
+                f"  {b['logical']:>8}  {b['physical']:>9}  "
+                f"  {b['token_range']:>12}  "
+                f"  {b['filled']}/{b['capacity']}"
+            )
+
+    print()
+    print("final block table:")
+    print(f"  {'logical':>8}  {'physical':>9}  {'tokens':>14}  {'fill':>8}")
+    for b in out["final_blocks"]:
         print(
-            f"{row['seq_id']:>4}  {row['prompt']:<42}  "
-            f"{row['total_tokens']:>6}t  "
-            f"{row['blocks_used']:>6}b  "
-            f"{row['blocks_static']:>6}b  "
-            f"{row['waste_pct']:>5.1%}"
+            f"  {b['logical']:>8}  {b['physical']:>9}  "
+            f"  {b['token_range']:>12}  "
+            f"  {b['filled']}/{b['capacity']}"
         )
-
-    print()
-    print(f"  static pre-allocation:  {out['peak_static']} blocks  "
-          f"({out['max_running']} slots × {out['blocks_static_per_slot']} blocks/slot)")
-    print(f"  paged (approx peak):    {out['peak_paged_approx']} blocks  "
-          f"(avg {out['avg_blocks_per_seq']:.1f} blocks/seq × {out['max_running']} concurrent)")
-    print(f"  reduction:              {out['peak_static'] / out['peak_paged_approx']:.1f}×")
