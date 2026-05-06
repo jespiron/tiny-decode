@@ -1,16 +1,12 @@
 from collections import deque
 from dataclasses import dataclass, field
-from math import ceil
-from typing import TYPE_CHECKING
+from typing import Optional
 
 import torch
 
-if TYPE_CHECKING:
-    from .kv_cache import BlockAllocator
-
 
 # ---------------------------------------------------------------------------
-# BlockAllocator (identical to step 2)
+# BlockAllocator (identical to steps 2 and 3)
 # ---------------------------------------------------------------------------
 
 class BlockAllocator:
@@ -52,10 +48,6 @@ class BlockAllocator:
         return self.kv_store.shape[0]
 
     @property
-    def n_free(self) -> int:
-        return len(self._free_list)
-
-    @property
     def n_allocated(self) -> int:
         return self._n_allocated
 
@@ -93,16 +85,16 @@ class BlockAllocator:
 
 
 # ---------------------------------------------------------------------------
-# BlockTable (new in step 3)
+# BlockTable (identical to step 3)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class BlockTable:
     block_size: int
     block_ids: list[int] = field(default_factory=list)
-    n_filled: int = 0  # total token slots written so far
+    n_filled: int = 0
 
-    def maybe_extend(self, allocator: "BlockAllocator") -> None:
+    def maybe_extend(self, allocator: BlockAllocator) -> None:
         if self.n_filled % self.block_size == 0:
             self.block_ids.append(allocator.alloc())
 
@@ -110,28 +102,97 @@ class BlockTable:
         self.n_filled += 1
 
     def physical_pos(self, token_pos: int) -> tuple[int, int]:
-        logical_block = token_pos // self.block_size
-        offset = token_pos % self.block_size
-        return self.block_ids[logical_block], offset
+        return self.block_ids[token_pos // self.block_size], token_pos % self.block_size
 
-    def free_all(self, allocator: "BlockAllocator") -> None:
+    def free_all(self, allocator: BlockAllocator) -> None:
         for block_id in self.block_ids:
             allocator.free(block_id)
         self.block_ids.clear()
         self.n_filled = 0
 
-    def describe(self, block_size: int | None = None) -> list[dict]:
-        bs = block_size or self.block_size
-        rows = []
-        for logical_idx, phys_id in enumerate(self.block_ids):
-            start = logical_idx * bs
-            end_max = (logical_idx + 1) * bs
-            filled = min(self.n_filled - start, bs)
-            rows.append({
-                "logical": logical_idx,
-                "physical": phys_id,
-                "token_range": f"{start}–{min(end_max, self.n_filled) - 1}",
-                "filled": filled,
-                "capacity": bs,
-            })
-        return rows
+
+# ---------------------------------------------------------------------------
+# PagedCache (new in step 4)
+# ---------------------------------------------------------------------------
+
+class PagedCache:
+    def __init__(
+        self,
+        block_table: BlockTable,
+        allocator: BlockAllocator,
+        n_layers: int,
+    ):
+        self.block_table = block_table
+        self.allocator = allocator
+        self.n_layers = n_layers
+        self._seen_tokens = 0
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[dict] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = key_states.shape[2]
+        start_pos = self._seen_tokens
+
+        if layer_idx == 0:
+            for i in range(seq_len):
+                pos = start_pos + i
+                if pos % self.allocator.block_size == 0:
+                    self.block_table.block_ids.append(self.allocator.alloc())
+
+        # Write each new token's K/V into its block slot.
+        for i in range(seq_len):
+            pos = start_pos + i
+            block_idx = pos // self.allocator.block_size
+            offset = pos % self.allocator.block_size
+            phys = self.block_table.block_ids[block_idx]
+            self.allocator.kv_store[phys, layer_idx, 0, :, offset, :] = key_states[0, :, i, :]
+            self.allocator.kv_store[phys, layer_idx, 1, :, offset, :] = value_states[0, :, i, :]
+
+        if layer_idx == self.n_layers - 1:
+            self._seen_tokens += seq_len
+            self.block_table.n_filled = self._seen_tokens
+
+        n_filled = start_pos + seq_len
+        return self._gather(layer_idx, n_filled)
+
+    def _gather(
+        self, layer_idx: int, n_filled: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs = self.allocator.block_size
+        n_full = n_filled // bs
+        remainder = n_filled % bs
+
+        k_chunks: list[torch.Tensor] = []
+        v_chunks: list[torch.Tensor] = []
+
+        for i, phys in enumerate(self.block_table.block_ids):
+            if i < n_full:
+                k_chunks.append(self.allocator.kv_store[phys, layer_idx, 0])
+                v_chunks.append(self.allocator.kv_store[phys, layer_idx, 1])
+            elif i == n_full and remainder > 0:
+                k_chunks.append(self.allocator.kv_store[phys, layer_idx, 0, :, :remainder, :])
+                v_chunks.append(self.allocator.kv_store[phys, layer_idx, 1, :, :remainder, :])
+                break
+
+        k_out = torch.cat(k_chunks, dim=1).unsqueeze(0)
+        v_out = torch.cat(v_chunks, dim=1).unsqueeze(0)
+        return k_out, v_out
+
+    # ------------------------------------------------------------------
+    # HuggingFace Cache interface
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self._seen_tokens
+
+    def get_max_length(self) -> Optional[int]:
+        return None
+
+    def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+        return self._seen_tokens
+
+    def get_mask_sizes(self, q_length: int, layer_idx: int = 0) -> tuple[int, int]:
+        return self._seen_tokens + q_length, 0
