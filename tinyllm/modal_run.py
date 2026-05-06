@@ -1,3 +1,5 @@
+import time
+
 import modal
 
 image = (
@@ -21,10 +23,12 @@ image = (
 )
 
 hf_cache = modal.Volume.from_name("tiny-decode-hf-cache", create_if_missing=True)
-app = modal.App("tiny-decode-phase3-step4")
+app = modal.App("tiny-decode-phase3-step5")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
 BLOCK_SIZE = 16
+MAX_NEW_TOKENS = 256
+CONCURRENCY_VALUES = [1, 2, 4, 8, 16, 32]
 
 _loaded: dict = {}
 
@@ -48,103 +52,147 @@ def mixed_prompts(n: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot / correctness check
+# Remote bench function
 # ---------------------------------------------------------------------------
-
-MAX_NEW_TOKENS_SNAPSHOT = 64
-ALL_PROMPTS = SHORT_PROMPTS + LONG_PROMPTS
-
-
-def _dynamic_run(lm, formatted: str, max_new_tokens: int) -> str:
-    """Run a single prompt with inline DynamicCache; return decoded text."""
-    import torch
-    from transformers import DynamicCache
-
-    tok = lm.tokenizer
-    enc = tok([formatted], return_tensors="pt", padding=False)
-    input_ids = enc.input_ids.to(lm.device)
-    attn_mask = enc.attention_mask.to(lm.device)
-    eos_ids = torch.tensor(lm.eos_token_ids, device=lm.device)
-
-    kv = DynamicCache()
-    with torch.inference_mode():
-        out = lm.model(input_ids=input_ids, attention_mask=attn_mask,
-                       past_key_values=kv, use_cache=True)
-    kv = out.past_key_values
-    all_ids = torch.cat([input_ids, out.logits[:, -1:, :].argmax(-1)], dim=1)
-
-    for _ in range(max_new_tokens):
-        with torch.inference_mode():
-            out = lm.model(
-                input_ids=all_ids[:, -1:],
-                attention_mask=torch.ones(1, all_ids.shape[1], device=lm.device),
-                past_key_values=kv, use_cache=True,
-            )
-        kv = out.past_key_values
-        next_id = out.logits[:, -1:, :].argmax(-1)
-        all_ids = torch.cat([all_ids, next_id], dim=1)
-        if torch.isin(next_id.squeeze(), eos_ids).item():
-            break
-    return tok.decode(all_ids[0], skip_special_tokens=True)
-
 
 @app.function(
     image=image,
     gpu="A10G",
     volumes={"/cache": hf_cache},
-    timeout=600,
+    timeout=1800,
 )
-def run_snapshot() -> dict:
-    """Run every prompt through both schedulers; compare output text for each."""
+def run_bench_remote(max_running: int, max_new_tokens: int) -> dict:
+    """Run DynamicScheduler then PagedScheduler; return throughput + latency stats."""
+    import gc
+    import torch
+
     from engine.model import format_prompt, load
     from engine.kv_cache import BlockAllocator
-    from engine.scheduler import PagedScheduler
+    from engine.scheduler import DynamicScheduler, PagedScheduler
 
     if "lm" not in _loaded:
         _loaded["lm"] = load(MODEL_NAME)
     lm = _loaded["lm"]
 
-    n_blocks = BlockAllocator.budget_n_blocks(lm.model, BLOCK_SIZE)
-    allocator = BlockAllocator.from_model(lm.model, BLOCK_SIZE, n_blocks, lm.device, lm.dtype)
+    raw_prompts = mixed_prompts(max_running * 2)
+    prompts = [format_prompt(lm.tokenizer, p) for p in raw_prompts]
 
-    results = []
-    for prompt in ALL_PROMPTS:
-        formatted = format_prompt(lm.tokenizer, prompt)
+    cfg = lm.model.config
+    head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    bytes_per_block = (
+        cfg.num_hidden_layers * 2 * cfg.num_key_value_heads
+        * BLOCK_SIZE * head_dim * 2
+    )
 
-        dynamic_text = _dynamic_run(lm, formatted, MAX_NEW_TOKENS_SNAPSHOT)
+    # ---- DynamicScheduler ----
+    dyn_oom = False
+    dyn_tps = 0.0
+    dyn_kv_gib = 0.0
+    try:
+        model_gib = torch.cuda.memory_allocated() / 1024**3
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        sched = DynamicScheduler(lm, prompts, max_new_tokens=max_new_tokens,
+                                 max_running=max_running, eos_token_ids=lm.eos_token_ids)
+        sched.run()
+        wall = time.perf_counter() - t0
+        total_tokens = sum(s.all_ids.shape[1] for s in sched.finished)
+        dyn_tps = total_tokens / wall
+        dyn_kv_gib = torch.cuda.max_memory_allocated() / 1024**3 - model_gib
+    except torch.cuda.OutOfMemoryError:
+        dyn_oom = True
 
-        sched = PagedScheduler(lm, [formatted], allocator,
-                               max_new_tokens=MAX_NEW_TOKENS_SNAPSHOT,
-                               max_running=1, eos_token_ids=lm.eos_token_ids)
-        texts, _, _ = sched.run()
-        paged_text = texts[0]
+    gc.collect()
+    torch.cuda.empty_cache()
 
-        results.append({
-            "prompt": prompt,
-            "match": dynamic_text == paged_text,
-            "dynamic_text": dynamic_text[:120],
-            "paged_text": paged_text[:120],
-        })
+    # ---- PagedScheduler ----
+    paged_oom = False
+    paged_tps = 0.0
+    paged_kv_gib = 0.0
+    try:
+        n_blocks = BlockAllocator.budget_n_blocks(lm.model, BLOCK_SIZE)
+        allocator = BlockAllocator.from_model(lm.model, BLOCK_SIZE, n_blocks, lm.device, lm.dtype)
+        t0 = time.perf_counter()
+        sched = PagedScheduler(lm, prompts, allocator, max_new_tokens=max_new_tokens,
+                               max_running=max_running, eos_token_ids=lm.eos_token_ids)
+        sched.run()
+        wall = time.perf_counter() - t0
+        total_tokens = sum(s.all_ids.shape[1] for s in sched.finished)
+        paged_tps = total_tokens / wall
+        paged_kv_gib = allocator.peak_allocated * bytes_per_block / 1024**3
+        del allocator
+    except torch.cuda.OutOfMemoryError:
+        paged_oom = True
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return {
-        "results": results,
-        "all_match": all(r["match"] for r in results),
+        "max_running": max_running,
+        "dyn_tps": dyn_tps,
+        "dyn_kv_gib": dyn_kv_gib,
+        "dyn_oom": dyn_oom,
+        "paged_tps": paged_tps,
+        "paged_kv_gib": paged_kv_gib,
+        "paged_oom": paged_oom,
     }
 
 
+# ---------------------------------------------------------------------------
+# tput entrypoint
+# ---------------------------------------------------------------------------
+
 @app.local_entrypoint()
-def snapshot():
-    out = run_snapshot.remote()
+def tput(max_new_tokens: int = MAX_NEW_TOKENS):
+    """Total throughput and average per-token latency, dyn vs paged.
+
+    tok/s     = total tokens generated / wall time.  Comparable to
+                "total_tok/s" from phase2-step4's sweep table.
+    ms/tok    = 1000 / tok/s.  Comparable to "ms/tok (per seq)" from
+                phase2-step4 and the Phase 1 single-sequence baseline.
+                For sequential forward passes this is flat with concurrency;
+                the plateau here mirrors the ~23 tok/s plateau in phase2.
+    """
     print()
-    all_match = out["all_match"]
-    print(f"all prompts match: {all_match}")
+    print(f"model={MODEL_NAME}  max_new_tokens={max_new_tokens}  block_size={BLOCK_SIZE}")
+    print(f"n_prompts = concur × 2  (mixed short + long)")
     print()
-    for r in out["results"]:
-        status = "OK " if r["match"] else "FAIL"
-        print(f"  [{status}] {r['prompt'][:60]!r}")
-        if not r["match"]:
-            print(f"         dynamic: {r['dynamic_text']!r}")
-            print(f"          paged:  {r['paged_text']!r}")
-    if not all_match:
-        print("\nWARNING: some prompts differ — paged attention has a bug.")
+    header = (
+        f"{'batch_size':>6}  "
+        f"{'dyn_tok/s':>10}  {'dyn_ms/tok':>11}  "
+        f"{'paged_tok/s':>12}  {'paged_ms/tok':>13}  "
+        f"{'dyn_kv':>7}  {'paged_kv':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for max_running in CONCURRENCY_VALUES:
+        out = run_bench_remote.remote(max_running=max_running, max_new_tokens=max_new_tokens)
+
+        if out["dyn_oom"]:
+            dyn_tps_s = f"{'(OOM)':>10}"
+            dyn_ms_s  = f"{'--':>11}"
+            dyn_kv_s  = f"{'--':>7}"
+        else:
+            dyn_tps_s = f"{out['dyn_tps']:>9.1f}t/s"
+            dyn_ms_s  = f"{1000/out['dyn_tps']:>10.1f}ms"
+            dyn_kv_s  = f"{out['dyn_kv_gib']:>6.2f}G"
+
+        if out["paged_oom"]:
+            paged_tps_s = f"{'(OOM)':>12}"
+            paged_ms_s  = f"{'--':>13}"
+            paged_kv_s  = f"{'--':>8}"
+        else:
+            paged_tps_s = f"{out['paged_tps']:>11.1f}t/s"
+            paged_ms_s  = f"{1000/out['paged_tps']:>12.1f}ms"
+            paged_kv_s  = f"{out['paged_kv_gib']:>7.2f}G"
+
+        print(
+            f"{out['max_running']:>6}  "
+            f"{dyn_tps_s}  {dyn_ms_s}  "
+            f"{paged_tps_s}  {paged_ms_s}  "
+            f"{dyn_kv_s}  {paged_kv_s}"
+        )
+        if out["paged_oom"]:
+            break
 
