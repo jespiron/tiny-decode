@@ -10,9 +10,21 @@ class BenchResult:
     model: str
     batch_size: int
     runs: int
-    tokens_per_sec: float   # for batches, this is total tok/s across all sequences in the batch
-    ms_per_token: float     # for batches, this is the mean per-sequence
+    tokens_per_sec: float   # for batches, total tok/s across all sequences
+    ms_per_token: float     # for batches, mean per-sequence decode latency
     ttft_ms: float
+    peak_memory_mb: float
+
+
+@dataclass
+class SpecBenchResult:
+    model: str
+    draft: str
+    K: int
+    runs: int
+    tokens_per_sec: float   # effective tok/s: total new tokens / total wall time
+    ms_per_token: float     # total wall time / total new tokens * 1000
+    acceptance_rate: float  # mean fraction of draft tokens accepted per round
     peak_memory_mb: float
 
 
@@ -93,7 +105,44 @@ def _run(
     )
 
 
-def to_dict(r: BenchResult) -> dict:
+def run_spec_benchmark(
+    spec_fn: Callable[[], tuple[str, list[float], float]],
+    model_name: str,
+    draft_name: str,
+    K: int,
+    warmup: int = 1,
+    runs: int = 3,
+) -> SpecBenchResult:
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(warmup):
+        spec_fn()
+
+    throughputs, ms_per_toks, acceptance_rates = [], [], []
+    for _ in range(runs):
+        _, per_round, acc_rate = spec_fn()
+        if not per_round:
+            continue
+        total_time = sum(per_round)
+        # E[tokens_per_round] = K * acceptance_rate + 1
+        # (accepted drafts + correction or bonus token)
+        n_tokens_est = len(per_round) * (K * acc_rate + 1)
+        throughputs.append(n_tokens_est / total_time)
+        ms_per_toks.append(total_time / n_tokens_est * 1000.0)
+        acceptance_rates.append(acc_rate)
+
+    return SpecBenchResult(
+        model=model_name,
+        draft=draft_name,
+        K=K,
+        runs=runs,
+        tokens_per_sec=statistics.mean(throughputs),
+        ms_per_token=statistics.mean(ms_per_toks),
+        acceptance_rate=statistics.mean(acceptance_rates),
+        peak_memory_mb=torch.cuda.max_memory_allocated() / 1024**2,
+    )
+
+
+def to_dict(r) -> dict:
     return asdict(r)
 
 
